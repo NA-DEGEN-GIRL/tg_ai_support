@@ -515,16 +515,29 @@ async def call_ai(prompt: str, model: Optional[str] = None) -> str:
 
 # ----- Action implementations -----
 async def _do_translate(text: str, reply_ctx: Optional[dict], rule: dict) -> str:
+    """Translate logic.
+
+    - Reply context + trigger ONLY (e.g. just `to en`)  -> translate the original
+      message we're replying to.
+    - Reply context + my own text before the trigger    -> translate MY text
+      (the user might be writing a translation of their own message even while
+      replying to someone — don't yank the source from the reply target).
+    - No reply context + my text                        -> translate my text.
+    - No reply context + bare trigger                   -> error.
+    """
     keyword = rule.get("keyword", "")
     target_lang = rule.get("lang", "English")
-    if reply_ctx:
+    user_part = strip_suffix(text, keyword)
+
+    if user_part:
+        source = user_part
+    elif reply_ctx:
         source = await get_message_text(reply_ctx["chat_id"], reply_ctx["message_id"])
         if not source:
             return "[error] couldn't fetch original message"
     else:
-        source = strip_suffix(text, keyword)
-        if not source:
-            return "[error] empty source"
+        return "[error] empty source"
+
     prompt = TRANSLATE_PROMPT.format(lang=target_lang, text=source)
     return await call_ai(prompt)
 

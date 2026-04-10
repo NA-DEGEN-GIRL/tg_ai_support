@@ -33,7 +33,7 @@
 나(자동) : I think today's meeting will be delayed by about 30 minutes.
 ```
 
-**(b) 상대 메시지 번역** — 상대 메시지에 reply 로 트리거 한 줄 보내면 그 원본을 번역:
+**(b) 상대 메시지 번역** — 상대 메시지에 reply 로 **트리거 한 줄만** 보내면 그 원본을 번역:
 
 ```
 친구       : お疲れ様です。明日の打ち合わせは予定通りです。
@@ -42,6 +42,8 @@
 ```
 
 데몬이 내가 reply 한 메시지의 원본을 TDLib 의 `getMessage` 로 fetch 한 다음 AI 에 번역 요청 보냄.
+
+> 주의: reply 메시지에 **내가 쓴 글 + 트리거** 를 같이 보내면 (`내 문장 to en` 처럼) 원본 메시지가 아니라 **내가 쓴 글** 이 번역됨. 답장 컨텍스트 안에서 내가 직접 작성한 다른 언어 메시지를 번역하고 싶을 때 유용.
 
 ### 3. AI 빠른 질문 (ask_ai)
 
@@ -348,7 +350,7 @@ tmux kill-session -t tgself  # 종료
 
 #### Case 2: 상대 메시지 번역
 
-같은 룰. 다른 사용 방식.
+같은 룰. 다른 사용 방식. **트리거만 단독으로** reply 해야 원본이 번역됨:
 
 ```
 친구: How's it going?
@@ -360,6 +362,21 @@ tmux kill-session -t tgself  # 종료
 1. 내 outgoing 메시지의 `reply_to.@type` 가 `messageReplyToMessage` 인지 확인
 2. 맞으면 → TDLib 의 `getMessage` 로 원본 메시지 fetch
 3. 그 텍스트를 번역해서 내 reply 메시지에 reply
+
+#### Case 3: reply 안에서 내 글 번역
+
+reply 메시지에 **내가 쓴 글 + 트리거** 를 같이 보내면 원본이 아니라 **내가 쓴 글** 이 번역됨:
+
+```
+친구: How's it going?
+나 (reply): 잘 지내고 있어요 to en
+나 (데몬): I'm doing well.   ← 친구 메시지가 아니라 내 글이 번역됨
+```
+
+원칙:
+- reply + 트리거만 → 원본 번역 (Case 2)
+- reply + 내 글 + 트리거 → 내 글 번역 (Case 3)
+- 그냥 메시지 + 트리거 → 내 글 번역 (Case 1)
 
 기본 제공 언어:
 - `to en` → English
