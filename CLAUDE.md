@@ -60,6 +60,19 @@
 - `config.json` 의 `ai.models` 에 등록된 모델만 허용.
 - 변경되면 `state.json` 에 저장. 데몬 재시작해도 유지.
 
+## Markdown → Telegram HTML 변환
+
+AI 출력 (특히 GPT 류) 은 standard markdown (`**bold**`, `*italic*`, `` `code` ``, ```` ```block``` ````, `[text](url)`, `# header`) 을 뱉음. 텔레그램은 그걸 그대로 못 알아먹어서 (텔레그램 markdown v2 는 `*bold*` 단일 asterisk 임) 변환 필요.
+
+방식:
+1. `md_to_telegram_html(text)` — 정규식으로 standard md → 텔레그램 HTML subset (`<b>`, `<i>`, `<s>`, `<code>`, `<pre>`, `<a>`) 변환. 코드블록과 링크 URL 은 placeholder 로 stash 했다가 복원해서 inline 처리에 안 망가지게. word-boundary lookaround 로 `foo_bar`, `2*x*5` 같은 식별자/수식 보호.
+2. `td_execute({@type: parseTextEntities, parse_mode: textParseModeHTML})` — TDLib 의 synchronous static method 로 HTML → `formattedText` (text + entities) 파싱.
+3. `sendMessage` 에 그 `formattedText` 를 그대로 박음.
+
+파싱 실패 (잘못된 HTML 등) 시 fallback: 원본 텍스트를 entity 없이 plain 으로 보냄. `[fmt] HTML parse failed (...)` 로그.
+
+`format_text` 는 `send_reply` 안에서 호출되므로 모든 답장 (정적 reply / 번역 결과 / AI 답변 / set_model 응답 / 에러 메시지) 에 자동 적용됨.
+
 ## AI 호출 흐름
 
 - `call_ai(prompt, model=None)` 가 디스패처. `model` 생략 시 `get_current_model()` 사용.

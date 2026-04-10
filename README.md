@@ -1,24 +1,137 @@
 # tg_self_reply
 
-내 텔레그램 **user account** 가 보낸 메시지를 듣고, 키워드 매칭 시 자동으로 답장 / 번역 / AI 질문 / 모델 변경 같은 액션을 수행하는 데몬. **봇 계정이 아니라 user account 자체** 를 사용하기 때문에 TDLib 의 JSON 인터페이스 (`libtdjson.so`) 를 ctypes 로 직접 바인딩함.
+> **내 텔레그램 계정에 자동 답장 / 번역 / AI 답변 기능을 붙여주는 개인 비서 데몬.**
+> 봇 계정이 아니라 **내 계정 자체** 가 답장을 보내기 때문에, 받는 사람 입장에선 그냥 내가 직접 답장한 것처럼 보임.
 
 ---
 
-## 소개
+## 이 데몬, 뭐 하는 거?
 
-텔레그램 봇 API 는 `Bot` 계정으로만 동작함. 내 계정 (user account) 으로 메시지를 보내거나 자동 응답하려면 MTProto 를 직접 다루거나 TDLib 같은 라이브러리가 필요함. 이 프로젝트는 후자.
+서버에서 백그라운드로 돌고 있다가 내가 핸드폰/PC 등 다른 디바이스에서 텔레그램에 메시지를 쓰면, 그 메시지를 보고 미리 정해둔 키워드 룰에 따라 자동으로 액션을 수행함. 내 계정으로 답장이 나가기 때문에 채팅방에 있는 사람들 입장에선 그냥 내가 답한 것처럼 보임 (봇 마크 같은 거 안 붙음).
 
-핵심 아이디어:
+지원 액션 4가지 + 보조 기능 1개:
 
-1. 내 계정으로 TDLib 세션을 띄움 (서버에서 백그라운드 데몬으로 돌림)
-2. 핸드폰 / 데스크탑 등 **다른 디바이스에서** 내가 메시지를 보내면 → TDLib 가 `updateNewMessage` 이벤트로 그걸 데몬에 알려줌
-3. 데몬이 그 메시지를 보고 룰에 매칭되면 → 내 계정으로 답장 (마찬가지로 user account 에서 보내는 거라 받는 사람 입장에서는 그냥 내가 답장한 것처럼 보임)
+### 1. 정적 자동 답장 (reply)
 
-용도:
-- 자주 쓰는 짧은 답변 자동화
-- 외국인 친구한테 모국어로 쓰고 자동 번역해서 보내기
-- 모르는 언어 메시지 받았을 때 reply 한 줄로 번역
-- 채팅 중에 AI 한테 빠르게 물어보기
+`config.json` 에 등록한 키워드를 보내면 정해둔 텍스트로 바로 답장.
+
+```
+나       : 테스트
+나(자동) : test done
+```
+
+자주 쓰는 짧은 답변을 자동화하는 용도. 예: "ㅇㅋ" → "확인했습니다, 곧 처리하겠습니다".
+
+### 2. 자동 번역 (translate)
+
+내가 쓴 글이든 상대가 보낸 글이든 같은 키워드 (`to en` / `to jp` / `to cn` / `to kr`) 로 번역. 두 가지 컨텍스트로 동작:
+
+**(a) 내가 쓴 글 번역** — 메시지 끝에 트리거 붙이면 그 메시지를 번역해서 답장:
+
+```
+나       : 오늘 회의 30분 정도 늦어질 것 같아요 to en
+나(자동) : I think today's meeting will be delayed by about 30 minutes.
+```
+
+**(b) 상대 메시지 번역** — 상대 메시지에 reply 로 트리거 한 줄 보내면 그 원본을 번역:
+
+```
+친구       : お疲れ様です。明日の打ち合わせは予定通りです。
+나 (reply) : to kr
+나(자동)   : 수고하셨습니다. 내일 미팅은 예정대로 진행됩니다.
+```
+
+데몬이 내가 reply 한 메시지의 원본을 TDLib 의 `getMessage` 로 fetch 한 다음 AI 에 번역 요청 보냄.
+
+### 3. AI 빠른 질문 (ask_ai)
+
+문장 끝에 `to ai` 를 붙이면 AI 한테 그 내용을 물어봐서 답변:
+
+```
+나       : 파이썬에서 dict 를 value 기준으로 정렬하는 한 줄 to ai
+나(자동) : sorted_d = dict(sorted(d.items(), key=lambda x: x[1]))
+```
+
+상대 메시지에 reply 로 `to ai` 만 보내면 그 메시지를 AI 한테 물어봐줌. 추가 instruction 도 가능:
+
+```
+친구       : What's the weather forecast for Seoul tomorrow?
+나 (reply) : 한국어로 짧게 to ai
+나(자동)   : 내일 서울은 흐리고 일부 비가 올 가능성이 있습니다.
+```
+
+### 4. AI 모델 변경 (set_model)
+
+`config.json` 의 `ai.models` 에 등록된 모델 사이에서 즉석 전환:
+
+```
+나       : ai model to gemini-2.5-pro
+나(자동) : [ok] model -> gemini-2.5-pro (gemini)
+```
+
+기본 등록된 모델: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.4-pro`, `gpt-5.3-codex`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3-flash-preview` 등. 변경된 모델은 `state.json` 에 저장돼서 데몬 재시작해도 유지됨.
+
+### + 마크다운 자동 변환 (보조 기능)
+
+AI 답변에 standard markdown (`**굵게**`, `*기울임*`, `` `코드` ``, ```` ```code block``` ````, `[링크](url)`, `# 헤더`, `- 리스트`) 이 섞여 있어도 텔레그램 포맷으로 자동 변환됨. AI 가 뱉는 raw 마크다운이 채팅에 별표 그대로 보이는 일 없음.
+
+---
+
+## 잠깐, "봇" 아니라고?
+
+텔레그램에는 두 종류의 클라이언트가 있음:
+
+|            | 봇 (Bot) 계정          | User 계정 (= 사람 계정)      |
+|------------|------------------------|------------------------------|
+| 만드는 법  | `@BotFather` 에 등록   | 핸드폰 번호로 가입            |
+| 표시       | 이름 옆에 봇 마크      | 일반 사용자                   |
+| 권한 범위  | 받는 메시지만 처리 가능 | 텔레그램 모든 기능            |
+| 사용 API   | Bot API (간단한 HTTP)   | MTProto / TDLib (저수준)      |
+
+이 프로젝트는 **봇 계정이 아니라 user 계정 (= 내 계정 자체)** 으로 동작함. 그래서:
+
+- 받는 사람 입장에선 그냥 내가 직접 답한 것처럼 보임 (봇 마크 X)
+- 봇이 초대 안 된 채팅방에서도 동작 (1:1, 일반 그룹, 채널 등 어디든)
+- **내가 보낸 메시지를 자동으로 후처리 가능** ← Bot API 로는 절대 못 하는 거
+
+이걸 가능하게 하려면 텔레그램이 제공하는 **TDLib** (`libtdjson.so`) 라는 C++ 라이브러리가 필요함. 이 프로젝트는 그걸 Python 의 `ctypes` 로 직접 바인딩해서 사용함.
+
+> ⚠️ **중요한 보안 사항**: TDLib 세션 파일 (`tdlib/db.sqlite`, `tdlib/td.binlog`) 은 **내 텔레그램 계정과 동등한 권한** 을 가짐. 이 파일을 가진 사람은 내 계정으로 로그인되어 있는 것과 같음. 절대 git 에 커밋하거나 공유 / 백업 / 업로드 하면 안 됨. 이 프로젝트의 `.gitignore` 가 자동으로 차단해두긴 했지만, 별도 백업을 만들 때도 주의할 것. `.env` (API 키) 와 `config.json` (api_id/api_hash) 도 마찬가지.
+
+---
+
+## 빠른 시작 (TL;DR)
+
+이미 TDLib 빌드 + Python 3.10+ + uv 가 준비된 사람용 한 줄 정리:
+
+```bash
+git clone https://github.com/NA-DEGEN-GIRL/tg_ai_support.git tg_self_reply
+cd tg_self_reply
+
+# venv + 의존성
+uv venv .venv
+source .venv/bin/activate
+uv pip compile requirements.in -o requirements.txt
+uv pip sync requirements.txt
+
+# 설정 파일 복사 후 채우기
+cp config.json.example config.json
+cp .env.example .env
+$EDITOR config.json    # api_id / api_hash 채우기 (https://my.telegram.org)
+$EDITOR .env           # OPENAI_API_KEY 채우기 (https://platform.openai.com/api-keys)
+
+# 첫 실행 (interactive: phone, code, 2FA)
+python main.py
+```
+
+`[auth] ready` 가 뜨면 성공. 이후로는 백그라운드로:
+
+```bash
+bash tmux.command            # detached tmux 세션 시작
+tmux attach -t tgself        # 로그 보기
+```
+
+처음 셋업하는 사람은 아래 [사전 준비](#사전-준비) → [설치](#설치) → [사용법](#사용법) 순서로 보면 됨.
 
 ---
 
@@ -179,6 +292,16 @@ Login code: <텔레그램에서 받은 코드>
 ```
 
 세션은 `tdlib/` 디렉토리에 저장됨. 두 번째 실행부터는 입력 안 받고 바로 동작.
+
+### 7. tmux 로 백그라운드 실행 (선택)
+
+첫 인증 후에는 `tmux.command` 로 detached tmux 세션에 띄울 수 있음:
+
+```bash
+bash tmux.command            # 세션 시작
+tmux attach -t tgself        # 로그 보기 (Ctrl+B 다음 D 로 detach)
+tmux kill-session -t tgself  # 종료
+```
 
 ---
 
@@ -565,6 +688,129 @@ ps aux | grep main.py
 1. 데몬이 그 채팅방을 알고 있는지 확인 — 데몬은 시작 시 `loadChats` 로 main chat list 를 로드함. archived chat 이나 새 채팅방은 자동으로 안 들어올 수 있음.
 2. `debug: true` 로 켜고 raw update 가 들어오는지 확인.
 3. 다른 디바이스에서 보낸 거 맞는지 확인 — 데몬이 띄워진 그 TDLib 인스턴스 자체에서 보낸 메시지는 `sending_state` 때문에 필터링됨.
+
+---
+
+## 자주 묻는 질문 (FAQ)
+
+### Q. 내가 핸드폰에서 보낸 메시지에만 반응하나요? 데스크탑에서 보내도 되나요?
+
+같은 텔레그램 계정으로 로그인된 어떤 디바이스에서 보내든 다 반응함. 데몬은 TDLib 가 emit 하는 `updateNewMessage` 의 `is_outgoing == True` 만 체크하기 때문에, 본인 계정에서 나간 메시지면 출처 디바이스 상관없음.
+
+단, **데몬 자체가 떠 있는 그 TDLib 인스턴스에서 직접 보낸 메시지** 는 `sending_state` 필터로 제외됨 (loop 방지). 그래서 데몬이 답장으로 보낸 메시지가 다시 룰에 매칭돼서 무한 루프 도는 일은 없음.
+
+### Q. 답장이 좀 느린데요? AI 호출 끝날 때까지 기다리나요?
+
+`reply` (정적 텍스트) 답장은 거의 즉시 (< 100ms). `translate` / `ask_ai` 는 AI provider 응답 속도에 따라 다름:
+
+- OpenAI `gpt-5.4-mini` / `nano`: 1~3초
+- OpenAI `gpt-5.4`: 3~10초
+- Gemini `2.5-flash`: 1~3초
+- Gemini `3-flash-preview`: 1~5초
+- 무거운 reasoning 모델 (`gpt-5.4-pro`, `gpt-5-pro`): 10~30초
+
+답장 늦는 동안 데몬은 다른 메시지를 동시에 처리할 수 있음 (`asyncio.create_task` 로 spawn 되기 때문에 이벤트 루프 안 막힘).
+
+### Q. 친구가 내 답장이 자동인 거 알아챌 수 있나요?
+
+봇 마크 같은 시각적 표시는 없음. 다만:
+
+- 답장 속도가 일관되게 짧으면 (특히 정적 답장의 경우) 의심받을 수 있음.
+- 트리거 키워드 (`to en` 등) 가 채팅에 그대로 보임. 데몬은 원본 메시지를 편집하지 않음. 어색하면 트리거 메시지를 보낸 후 텔레그램 클라이언트에서 직접 삭제하면 됨.
+
+### Q. 데몬을 두 개 띄우면 어떻게 되나요?
+
+같은 user account 로 두 데몬이 떠 있으면 둘 다 같은 `updateNewMessage` 를 받기 때문에 답장이 두 번 나감. 한 번에 한 인스턴스만 띄울 것:
+
+```bash
+ps aux | grep main.py
+tmux ls
+```
+
+### Q. 룰을 추가했는데 적용이 안 돼요.
+
+`config.json` 의 mtime 이 바뀌어야 hot reload 가 트리거됨. 에디터에 따라 저장해도 mtime 이 안 바뀌거나 swap 파일로 저장 후 rename 하는 경우 등이 있음. 안 되면:
+
+1. `touch config.json` 으로 강제로 mtime 갱신
+2. 데몬 로그에 `[config] reloaded` 가 뜨는지 확인
+
+`api_id`, `api_hash`, `tdjson_path`, `max_recent_messages`, `save_interval_seconds` 같은 부트 시 한 번만 읽는 필드는 hot reload 안 됨. 재시작 필요.
+
+### Q. AI API 비용이 얼마나 나오나요?
+
+AI provider 의 사용량 기반 과금. 텔레그램 메시지 1개당 prompt 길이에 따라 다르지만 대략적인 감 (실제 가격은 provider 가격표 참고):
+
+- `gpt-5.4-mini` 짧은 번역 1회: 매우 저렴 (1만 번 = 약 $1 수준)
+- `gpt-5.4` 짧은 번역 1회: 적당함 (1천 번 = 약 $1 수준)
+- `gpt-5.4-pro`, `gpt-5-pro` 같은 reasoning 모델: 일반 모델보다 5~10배 비쌈
+
+폭주 방지를 위해 OpenAI / Gemini 콘솔에서 monthly hard limit 을 미리 설정해두는 걸 권장.
+
+### Q. 메시지를 못 보는 것 같아요.
+
+1. **데몬이 그 채팅방을 알고 있는지**: 데몬은 부트 시 `loadChats` 로 main chat list 만 로드함. archived chat / folder 안의 chat / 새로 추가된 채팅방은 자동 로드 안 될 수 있음. 한 번 핸드폰 클라이언트에서 그 채팅방을 열면 동기화됨.
+2. **debug 모드 켜기**: `config.json` 에서 `"debug": true` → 모든 raw update 가 `[debug]` 로 보임. (단, 양이 많아서 일시적 디버깅 용도로만)
+3. **데몬 자체 디바이스 vs 다른 디바이스**: 데몬이 떠 있는 그 머신의 TDLib 인스턴스에서 직접 보낸 메시지는 무시됨 (loop 방지). 핸드폰 등 다른 디바이스에서 보내야 함.
+
+### Q. 인증을 다시 하고 싶어요 / 세션이 깨졌어요.
+
+```bash
+rm -rf tdlib/
+python main.py
+```
+
+`tdlib/` 디렉토리를 통째로 삭제하면 세션이 리셋되고 다음 실행 시 phone/code/2FA 부터 다시 받음. **단, 이건 내 계정의 디바이스 세션 하나를 무효화하는 거라 핸드폰 텔레그램에서 "Active Sessions" 에 다시 새로 뜸. 정상.**
+
+### Q. 데몬이 답장한 결과는 어디서 볼 수 있나요?
+
+세 군데:
+
+1. **터미널 로그** — `[me] -> (action) '결과'` 라인. tmux 안에서 `tmux attach -t tgself` 로 볼 수 있음.
+2. **텔레그램 채팅방 자체** — 답장이 실제로 거기 발송됨.
+3. **`messages.json`** — 60초마다 스냅샷되는 인메모리 deque 의 최근 500개. 단, 이건 원본 메시지만 저장하고 답장 결과는 안 저장 (채팅방에 이미 남아 있어서 중복 저장 불필요).
+
+### Q. 내 계정이 텔레그램에서 막힐 수도 있나요?
+
+자동화된 메시지를 너무 많이 보내면 텔레그램에서 임시 / 영구 ban 위험이 있음. 특히:
+
+- 같은 메시지를 짧은 시간에 다른 사람들한테 spam 으로 보내는 경우
+- 가입한 지 얼마 안 된 새 계정이 갑자기 자동화하는 경우
+
+개인 용도 (자기 자신의 메시지에 답장 / 친구들과의 대화에 가끔 트리거) 정도면 보통 문제 없음. 절대 안전 보장은 못 함. 본인 책임으로 사용.
+
+### Q. config.json 에 새 번역 언어를 추가하고 싶어요.
+
+`rules` 배열에 같은 형식으로 추가하면 됨. 저장만 하면 hot reload:
+
+```json
+{"match": "suffix", "keyword": "to es", "action": "translate", "lang": "Spanish"},
+{"match": "suffix", "keyword": "to fr", "action": "translate", "lang": "French"},
+{"match": "suffix", "keyword": "to vi", "action": "translate", "lang": "Vietnamese"}
+```
+
+`lang` 은 AI 한테 전달되는 번역 대상 언어 이름이라 자연어로 적으면 됨.
+
+### Q. 새 AI 모델이 나왔는데 추가하려면?
+
+`config.json` 의 `ai.models` 의 해당 provider 배열에 모델 ID 추가 → 저장 → hot reload 됨. 그 다음 `ai model to <new>` 명령으로 전환 가능.
+
+```json
+"models": {
+    "openai": ["gpt-5.4", "gpt-5.5", "..."],
+    "gemini": ["gemini-2.5-pro", "gemini-3.1-pro", "..."]
+}
+```
+
+### Q. tmux 가 뭔가요? 꼭 써야 하나요?
+
+tmux 는 터미널 멀티플렉서. 데몬을 돌리다가 SSH 연결을 끊어도 백그라운드에서 계속 동작하게 해줌. 안 쓰면 SSH 끊는 순간 데몬도 같이 죽음.
+
+대안:
+- `nohup python main.py &` (간단하지만 로그 보기 불편)
+- `systemd` service (제대로 된 서비스 운영, 셋업 필요)
+- `screen` (tmux 와 유사한 옛날 도구)
+
+이 프로젝트는 단순함을 위해 `tmux.command` helper 만 제공. 더 진지하게 운영하려면 systemd 권장.
 
 ---
 

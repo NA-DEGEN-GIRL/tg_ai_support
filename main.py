@@ -19,8 +19,10 @@ require a restart. API keys live in .env (OPENAI_API_KEY, GEMINI_API_KEY).
 
 import asyncio
 import ctypes
+import html as html_module
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -160,6 +162,8 @@ _td.td_json_client_create.restype = ctypes.c_void_p
 _td.td_json_client_send.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 _td.td_json_client_receive.argtypes = [ctypes.c_void_p, ctypes.c_double]
 _td.td_json_client_receive.restype = ctypes.c_char_p
+_td.td_json_client_execute.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+_td.td_json_client_execute.restype = ctypes.c_char_p
 _td.td_json_client_destroy.argtypes = [ctypes.c_void_p]
 
 _client = _td.td_json_client_create()
@@ -175,6 +179,17 @@ def td_receive(timeout: float = 1.0):
     if not raw:
         return None
     return json.loads(raw.decode("utf-8"))
+
+
+def td_execute(query: dict) -> Optional[dict]:
+    """Synchronous TDLib call. Used for parseTextEntities (markdown/HTML formatting)."""
+    raw = _td.td_json_client_execute(_client, json.dumps(query).encode("utf-8"))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        return None
 
 
 # ----- TDLib request/response correlation -----
@@ -281,10 +296,113 @@ def strip_prefix(text: str, prefix: str) -> str:
     return text
 
 
+# ----- Markdown → Telegram HTML converter -----
+
+_PLACEHOLDER_RE = re.compile(r"\x00C(\d+)\x00")
+
+
+def md_to_telegram_html(text: str) -> str:
+    """Convert standard markdown (as AI models output) to Telegram-flavored HTML.
+
+    Telegram HTML only supports a small subset of inline tags. We map:
+        **bold** / __bold__         -> <b>
+        *italic* / _italic_         -> <i>
+        ~~strike~~                  -> <s>
+        `inline code`               -> <code>
+        ```lang\\ncode```           -> <pre><code class="language-lang">
+        [text](url)                 -> <a href="url">
+        # Header                    -> <b> (Telegram has no header tag)
+        - / * bullet                -> • prefix (no list tag)
+
+    Code blocks and link URLs are stashed first so the inline-formatting
+    regexes can't mangle their contents. Bold/italic regexes use word-boundary
+    lookarounds so identifiers (`foo_bar`, `2*x*5`) aren't accidentally matched.
+    """
+    segments: list = []
+
+    def stash(m):
+        segments.append(m.group(0))
+        return f"\x00C{len(segments) - 1}\x00"
+
+    # 1) Stash code blocks (raw content preserved through escaping)
+    text = re.sub(r"```(?:[\w+-]*\n)?.*?```", stash, text, flags=re.DOTALL)
+    text = re.sub(r"`[^`\n]+`", stash, text)
+
+    # 2) Stash markdown links as fully-formed anchor tags
+    def stash_link(m):
+        link_text = m.group(1)
+        url = m.group(2)
+        text_esc = html_module.escape(link_text, quote=False)
+        url_esc = html_module.escape(url, quote=True)
+        anchor = f'<a href="{url_esc}">{text_esc}</a>'
+        segments.append(anchor)
+        return f"\x00C{len(segments) - 1}\x00"
+
+    text = re.sub(r"\[([^\[\]]+?)\]\(([^()\s]+?)\)", stash_link, text)
+
+    # 3) HTML-escape the rest
+    text = html_module.escape(text, quote=False)
+
+    # 4) Headers (before bold, so `# **x**` still gets bolded inside)
+    text = re.sub(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # 5) Bold (process before italic so ** doesn't get half-eaten)
+    text = re.sub(r"(?<![\w*])\*\*(.+?)\*\*(?![\w*])", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![\w_])__(.+?)__(?![\w_])", r"<b>\1</b>", text, flags=re.DOTALL)
+
+    # 6) Italic — boundary checks skip identifiers (foo_bar) and math (2*x*5)
+    text = re.sub(r"(?<![\w*])\*(?!\*)(.+?)(?<!\*)\*(?![\w*])", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![\w_])_(?!_)(.+?)(?<!_)_(?![\w_])", r"<i>\1</i>", text, flags=re.DOTALL)
+
+    # 7) Strikethrough
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
+
+    # 8) Bullets at start of line
+    text = re.sub(r"^[ \t]*[-*][ \t]+", "• ", text, flags=re.MULTILINE)
+
+    # 9) Restore stashed segments to their final HTML form
+    def restore(m):
+        idx = int(m.group(1))
+        raw = segments[idx]
+        if raw.startswith("<a "):
+            return raw
+        if raw.startswith("```"):
+            inner = re.match(r"```([\w+-]*)\n?(.*?)```", raw, re.DOTALL)
+            if inner:
+                lang = inner.group(1)
+                code = inner.group(2).rstrip("\n")
+                code_esc = html_module.escape(code, quote=False)
+                if lang:
+                    return f'<pre><code class="language-{lang}">{code_esc}</code></pre>'
+                return f"<pre>{code_esc}</pre>"
+            return html_module.escape(raw, quote=False)
+        # Inline `code`
+        inner = raw[1:-1]
+        return f"<code>{html_module.escape(inner, quote=False)}</code>"
+
+    return _PLACEHOLDER_RE.sub(restore, text)
+
+
+def format_text(text: str) -> dict:
+    """Convert markdown text to a TDLib formattedText, falling back to plain on parse error."""
+    if not text:
+        return {"@type": "formattedText", "text": "(empty)"}
+    html_text = md_to_telegram_html(text)
+    result = td_execute({
+        "@type": "parseTextEntities",
+        "text": html_text,
+        "parse_mode": {"@type": "textParseModeHTML"},
+    })
+    if result and result.get("@type") == "formattedText":
+        return result
+    err = result.get("message", "no response") if result else "no response"
+    print(f"[fmt] HTML parse failed ({err}), falling back to plain text")
+    return {"@type": "formattedText", "text": text}
+
+
 # ----- Telegram actions -----
 def send_reply(chat_id: int, message_id: int, text: str) -> None:
-    if not text:
-        text = "(empty)"
+    formatted = format_text(text)
     td_send({
         "@type": "sendMessage",
         "chat_id": chat_id,
@@ -294,10 +412,7 @@ def send_reply(chat_id: int, message_id: int, text: str) -> None:
         },
         "input_message_content": {
             "@type": "inputMessageText",
-            "text": {
-                "@type": "formattedText",
-                "text": text,
-            },
+            "text": formatted,
         },
     })
 
@@ -616,8 +731,8 @@ async def event_loop() -> None:
 
 
 async def main() -> None:
-    # 0 = FATAL only. Bump to 1+ to surface TDLib errors.
-    td_send({"@type": "setLogVerbosityLevel", "new_verbosity_level": 0})
+    # 0 = FATAL only. Synchronous so it takes effect before any other TDLib chatter.
+    td_execute({"@type": "setLogVerbosityLevel", "new_verbosity_level": 0})
     load_state()
     load_messages()
     print(f"[init] model={get_current_model() or '(unset)'}")
