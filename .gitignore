@@ -1,0 +1,11 @@
+.env
+config.json
+tdlib/
+.venv/
+__pycache__/
+*.pyc
+*.log
+messages.json
+messages.json.tmp
+state.json
+state.json.tmp
