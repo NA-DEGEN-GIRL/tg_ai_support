@@ -346,13 +346,17 @@ def md_to_telegram_html(text: str) -> str:
     # 4) Headers (before bold, so `# **x**` still gets bolded inside)
     text = re.sub(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", r"<b>\1</b>", text, flags=re.MULTILINE)
 
-    # 5) Bold (process before italic so ** doesn't get half-eaten)
-    text = re.sub(r"(?<![\w*])\*\*(.+?)\*\*(?![\w*])", r"<b>\1</b>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<![\w_])__(.+?)__(?![\w_])", r"<b>\1</b>", text, flags=re.DOTALL)
+    # 5) Bold (process before italic so ** doesn't get half-eaten).
+    # ASCII-only boundary class so Korean / Japanese / Chinese text adjacent to
+    # ** still bolds (`안녕**중요**입니다`). Python's \w would match those as
+    # word chars and block the match.
+    text = re.sub(r"(?<![A-Za-z0-9_*])\*\*(.+?)\*\*(?![A-Za-z0-9_*])", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![A-Za-z0-9_])__(.+?)__(?![A-Za-z0-9_])", r"<b>\1</b>", text, flags=re.DOTALL)
 
-    # 6) Italic — boundary checks skip identifiers (foo_bar) and math (2*x*5)
-    text = re.sub(r"(?<![\w*])\*(?!\*)(.+?)(?<!\*)\*(?![\w*])", r"<i>\1</i>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<![\w_])_(?!_)(.+?)(?<!_)_(?![\w_])", r"<i>\1</i>", text, flags=re.DOTALL)
+    # 6) Italic — same ASCII-only boundary; still skips identifiers (foo_bar)
+    # and math (2*x*5) but allows non-ASCII text adjacent to a single * or _.
+    text = re.sub(r"(?<![A-Za-z0-9_*])\*(?!\*)(.+?)(?<!\*)\*(?![A-Za-z0-9_*])", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![A-Za-z0-9_])_(?!_)(.+?)(?<!_)_(?![A-Za-z0-9_])", r"<i>\1</i>", text, flags=re.DOTALL)
 
     # 7) Strikethrough
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
