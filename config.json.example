@@ -40,7 +40,8 @@
         {"match": "suffix", "keyword": "to cn", "action": "translate", "lang": "Chinese (Simplified)"},
         {"match": "suffix", "keyword": "to kr", "action": "translate", "lang": "Korean"},
 
-        {"match": "suffix", "keyword": "to ai", "action": "ask_ai"},
+        {"match": "suffix", "keyword": "to ai",  "action": "ask_ai"},
+        {"match": "suffix", "keyword": "to web", "action": "ask_ai", "search": true},
 
         {"match": "prefix", "keyword": "ai model to ", "action": "set_model"}
     ]

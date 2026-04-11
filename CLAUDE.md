@@ -30,6 +30,7 @@
 | `reply` | 정적 텍스트 답장 | `"테스트"` → `"test done"` |
 | `translate` | AI 로 번역 후 답장 | `"오늘 뭐함 to en"` → `"What are you up to today"` |
 | `ask_ai` | AI 에 질문 후 답장 | `"파이썬 list comprehension 예시 to ai"` |
+| `ask_ai` + `search:true` | 웹검색 grounding 후 답장 | `"비트코인 시세 to web"` |
 | `set_model` | 현재 사용 모델 변경 | `"ai model to gpt-5.4-pro"` |
 
 매칭 모드 (`match`): `exact` / `contains` / `prefix` / `suffix`. 모두 case-insensitive (exact / contains 제외 — exact 는 strict, contains 는 strict).
@@ -54,6 +55,16 @@
 - **reply context**: 상대 메시지에 reply 로 `"to ai"` → 그 메시지를 prompt 로 AI 답변
   - reply 에 추가 텍스트 있으면 instruction 으로 prepend: `"in haiku to ai"` → `"in haiku\n\n---\n<원본>"`
 
+### 웹검색 grounding (`search: true`)
+
+`ask_ai` rule 에 `"search": true` 를 붙이면 provider 의 native 웹검색이 활성화됨. 기본 rule 은 `to web` (suffix). standalone / reply context 양쪽 모두 `to ai` 와 동일하게 작동하고 두 rule 이 공존함 — 빠른 Q&A 는 `to ai`, 최신 정보 필요하면 `to web` 로 분리.
+
+provider 별 구현 (`search=True` 일 때):
+- **OpenAI**: `/v1/chat/completions` 대신 `/v1/responses` 로 POST, `tools: [{"type": "web_search"}]` 추가. chat completions 엔 gpt-5.x 용 `web_search` 툴이 없어서 Responses API 가 유일한 길. 응답 파싱도 달라짐: `choices[0].message.content` 대신 `output[]` 배열에서 `type=="message"` 아이템 찾아 `content[].type=="output_text"` 텍스트 추출 (top-level `output_text` convenience field 있으면 우선 사용).
+- **Gemini**: `generateContent` 엔드포인트 그대로. payload 에 `tools: [{"google_search": {}}]` 만 추가 (gemini-2.x / 3.x 용 tool name; gemini-1.5 는 `google_search_retrieval` 로 달랐음). 응답 포맷은 동일, `groundingMetadata` 가 같이 오지만 본문만 쓰면 됨.
+
+timeout 은 검색 경로에서 60s → 120s 로 늘림 (웹검색 round-trip 대비).
+
 ## 모델 변경 (set_model)
 
 `ai model to <model_name>` (prefix). 예: `ai model to gemini-2.5-pro`.
@@ -75,11 +86,12 @@ AI 출력 (특히 GPT 류) 은 standard markdown (`**bold**`, `*italic*`, `` `co
 
 ## AI 호출 흐름
 
-- `call_ai(prompt, model=None)` 가 디스패처. `model` 생략 시 `get_current_model()` 사용.
+- `call_ai(prompt, model=None, search=False)` 가 디스패처. `model` 생략 시 `get_current_model()` 사용. `search=True` 면 provider 별 웹검색 경로로 라우팅 (OpenAI Responses API / Gemini `google_search` tool).
 - `get_provider(model)` 가 `ai.models` dict 에서 provider 찾아냄 (openai / gemini).
 - `httpx.AsyncClient` 로 직접 HTTP POST. SDK 의존성 없음.
-  - OpenAI: `https://api.openai.com/v1/chat/completions`
-  - Gemini: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
+  - OpenAI (비검색): `https://api.openai.com/v1/chat/completions`
+  - OpenAI (검색): `https://api.openai.com/v1/responses`
+  - Gemini: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` (검색 여부는 payload 의 `tools` 필드로)
 - AI 호출은 `asyncio.create_task` 로 spawn → 이벤트 루프 블로킹 안 됨.
 
 ## TDLib request/response correlation

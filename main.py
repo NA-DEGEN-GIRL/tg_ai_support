@@ -458,40 +458,73 @@ TRANSLATE_PROMPT = (
 )
 
 
-async def call_openai(prompt: str, model: str) -> str:
+async def call_openai(prompt: str, model: str, search: bool = False) -> str:
     if not OPENAI_API_KEY:
         return "[error] OPENAI_API_KEY not set"
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
+        async with httpx.AsyncClient(timeout=120 if search else 60) as client:
+            if search:
+                # chat/completions has no `web_search` tool for gpt-5.x; the
+                # Responses API (/v1/responses) is the canonical tool-use path.
+                r = await client.post(
+                    "https://api.openai.com/v1/responses",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "input": prompt,
+                        "tools": [{"type": "web_search"}],
+                    },
+                )
+            else:
+                r = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
         if r.status_code != 200:
             return f"[openai {r.status_code}] {r.text[:200]}"
         data = r.json()
+        if search:
+            # Responses API: SDKs expose an aggregated `output_text` convenience
+            # field, but raw HTTP may omit it — fall back to walking output[]
+            # and pulling text out of the assistant message item.
+            if isinstance(data.get("output_text"), str) and data["output_text"]:
+                return data["output_text"].strip()
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            return (c.get("text") or "").strip()
+            return "[openai error] no text in response"
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"[openai error] {e}"
 
 
-async def call_gemini(prompt: str, model: str) -> str:
+async def call_gemini(prompt: str, model: str, search: bool = False) -> str:
     if not GEMINI_API_KEY:
         return "[error] GEMINI_API_KEY not set"
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        payload: dict = {"contents": [{"parts": [{"text": prompt}]}]}
+        if search:
+            # `google_search` is the grounding tool for gemini-2.x / 3.x.
+            # (gemini-1.5 used the older `google_search_retrieval` name.)
+            payload["tools"] = [{"google_search": {}}]
+        async with httpx.AsyncClient(timeout=120 if search else 60) as client:
             r = await client.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 params={"key": GEMINI_API_KEY},
                 headers={"Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
+                json=payload,
             )
         if r.status_code != 200:
             return f"[gemini {r.status_code}] {r.text[:200]}"
@@ -501,15 +534,15 @@ async def call_gemini(prompt: str, model: str) -> str:
         return f"[gemini error] {e}"
 
 
-async def call_ai(prompt: str, model: Optional[str] = None) -> str:
+async def call_ai(prompt: str, model: Optional[str] = None, search: bool = False) -> str:
     model = model or get_current_model()
     if not model:
         return "[error] no model selected"
     provider = get_provider(model)
     if provider == "openai":
-        return await call_openai(prompt, model)
+        return await call_openai(prompt, model, search=search)
     if provider == "gemini":
-        return await call_gemini(prompt, model)
+        return await call_gemini(prompt, model, search=search)
     return f"[error] unknown model: {model}"
 
 
@@ -554,7 +587,7 @@ async def _do_ask_ai(text: str, reply_ctx: Optional[dict], rule: dict) -> str:
         if not user_part:
             return "[error] empty prompt"
         prompt = user_part
-    return await call_ai(prompt)
+    return await call_ai(prompt, search=bool(rule.get("search")))
 
 
 def _do_set_model(text: str, rule: dict) -> str:
