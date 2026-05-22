@@ -1,28 +1,27 @@
 """
-tg_self_reply: Telegram self-reply daemon with AI features.
+tg_self_reply: Telegram self-reply daemon with local CLI-backed LLM support.
 
-Listens for messages your own Telegram user account sends and dispatches the
-configured action when text matches a rule:
+Listens for outgoing messages from your own Telegram user account and dispatches
+configured actions when text matches a rule:
 
-  - reply     : send a static text reply
-  - translate : ask the current AI model to translate (target lang from rule)
-  - ask_ai    : send the message to the current AI model and reply with the answer
-  - set_model : switch the active AI model (e.g. "ai model to gpt-5.4")
+  - reply        : send a static text reply
+  - translate    : translate through Codex CLI headless mode
+  - ask_llm      : ask a logged-in Codex / Claude / Grok interactive CLI session
+  - set_provider : switch the default interactive provider
 
-For translate / ask_ai, when the trigger comes from a *reply* to someone else's
-message, the source text is fetched from that original message via TDLib's
-getMessage instead of taken from your own text.
-
-config.json hot-reloads on mtime change so adding rules or models doesn't
-require a restart. API keys live in .env (OPENAI_API_KEY, GEMINI_API_KEY).
+The daemon uses TDLib through ctypes. AI API keys are not required; LLM work is
+delegated to already-authenticated local CLI tools.
 """
 
 import asyncio
+import copy
 import ctypes
 import html as html_module
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import time
 import uuid
@@ -32,33 +31,65 @@ from getpass import getpass
 from pathlib import Path
 from typing import Optional
 
-import httpx
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
-ENV_PATH = ROOT / ".env"
 MESSAGES_FILE = ROOT / "messages.json"
 STATE_FILE = ROOT / "state.json"
 
-
-# ----- .env loader (stdlib only) -----
-def load_env(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
-        os.environ.setdefault(key.strip(), value)
-
-
-load_env(ENV_PATH)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+DEFAULT_LLM_CONFIG = {
+    "default_provider": "codex",
+    "continue_keyword": "cont",
+    "bridge_dir": ".llm_bridge",
+    "poll_interval_seconds": 1.0,
+    "output_stable_seconds": 1.0,
+    "translation": {
+        "provider": "codex",
+        "timeout_seconds": 120,
+        "command": (
+            "codex exec -C {root} --sandbox read-only "
+            "--ask-for-approval never -o {output} -"
+        ),
+    },
+    "providers": {
+        "codex": {
+            "session_name": "tgself-codex",
+            "command": (
+                "codex --no-alt-screen --search -C {root} "
+                "--dangerously-bypass-approvals-and-sandbox"
+            ),
+            "continue_command": (
+                "codex resume --last --no-alt-screen --search -C {root} "
+                "--dangerously-bypass-approvals-and-sandbox"
+            ),
+            "prompt_delivery": "argv",
+            "timeout_seconds": 900,
+            "startup_delay_seconds": 3.0,
+            "reset_strategy": "recreate",
+        },
+        "claude": {
+            "session_name": "tgself-claude",
+            "command": "claude --dangerously-skip-permissions",
+            "continue_command": "claude --continue --dangerously-skip-permissions",
+            "prompt_delivery": "argv",
+            "timeout_seconds": 900,
+            "startup_delay_seconds": 3.0,
+            "reset_strategy": "recreate",
+        },
+        "grok": {
+            "session_name": "tgself-grok",
+            "command": (
+                "grok --no-alt-screen --cwd {root} --always-approve "
+                "--permission-mode bypassPermissions"
+            ),
+            "prompt_delivery": "paste",
+            "submit_keys": ["Enter"],
+            "timeout_seconds": 900,
+            "startup_delay_seconds": 3.0,
+            "reset_strategy": "recreate",
+        },
+    },
+}
 
 
 # ----- Config (hot reload on mtime) -----
@@ -67,7 +98,7 @@ _config_mtime: float = 0.0
 
 
 def get_config() -> dict:
-    """Reparse config.json when its mtime changes; return the cached dict otherwise."""
+    """Reparse config.json when its mtime changes; return cached config otherwise."""
     global _config_cache, _config_mtime
     try:
         mtime = CONFIG_PATH.stat().st_mtime
@@ -88,8 +119,66 @@ def get_config() -> dict:
     return _config_cache
 
 
-# Bootstrap fields that don't hot-reload (changing them needs a restart anyway).
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def get_llm_config() -> dict:
+    return _deep_merge(DEFAULT_LLM_CONFIG, get_config().get("llm", {}))
+
+
+def get_bridge_root() -> Path:
+    bridge_dir = get_llm_config().get("bridge_dir", ".llm_bridge")
+    path = Path(bridge_dir)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def get_rules() -> list:
+    return get_config().get("rules", [])
+
+
+def get_continue_keyword() -> str:
+    return str(get_llm_config().get("continue_keyword", "cont")).strip()
+
+
+def get_provider_names() -> set[str]:
+    return set(get_llm_config().get("providers", {}).keys())
+
+
+def get_provider_config(provider: str) -> Optional[dict]:
+    return get_llm_config().get("providers", {}).get(provider)
+
+
+def get_default_provider() -> str:
+    cfg = get_llm_config()
+    default = cfg.get("default_provider", "codex")
+    if default in cfg.get("providers", {}):
+        return default
+    providers = list(cfg.get("providers", {}).keys())
+    return providers[0] if providers else ""
+
+
+def is_valid_provider(provider: str) -> bool:
+    return provider in get_provider_names()
+
+
+def format_template(template: str, **values) -> str:
+    quoted = {key: shlex.quote(str(value)) for key, value in values.items()}
+    return template.format(**quoted)
+
+
+# Bootstrap fields that do not hot-reload.
 get_config()
+if not _config_cache:
+    raise RuntimeError("config.json is required; copy config.json.example first")
 API_ID = int(_config_cache["api_id"])
 API_HASH = _config_cache["api_hash"]
 TDJSON_PATH = os.path.expanduser(_config_cache["tdjson_path"])
@@ -98,32 +187,13 @@ SAVE_INTERVAL = float(_config_cache.get("save_interval_seconds", 60))
 DB_DIR = str(ROOT / "tdlib")
 
 
-def get_rules() -> list:
-    return get_config().get("rules", [])
-
-
-def get_ai_section() -> dict:
-    return get_config().get("ai", {})
-
-
-def get_default_model() -> str:
-    return get_ai_section().get("default_model", "")
-
-
-def get_provider(model: str) -> Optional[str]:
-    """Look up which provider serves a given model name."""
-    for provider, models in get_ai_section().get("models", {}).items():
-        if model in models:
-            return provider
-    return None
-
-
 # ----- Runtime state -----
 recent_messages: "deque[dict]" = deque(maxlen=MAX_RECENT)
 chat_titles: dict = {}
 authorized = False
 dirty = False
 _state: dict = {}
+_provider_locks: dict[str, asyncio.Lock] = {}
 
 
 def load_state() -> None:
@@ -144,16 +214,27 @@ def save_state() -> None:
     os.replace(tmp, STATE_FILE)
 
 
-def get_current_model() -> str:
-    return _state.get("current_model") or get_default_model()
+def get_current_provider() -> str:
+    provider = _state.get("current_provider") or get_default_provider()
+    if is_valid_provider(provider):
+        return provider
+    return get_default_provider()
 
 
-def set_current_model(model: str) -> None:
-    _state["current_model"] = model
+def set_current_provider(provider: str) -> None:
+    _state["current_provider"] = provider
     try:
         save_state()
     except OSError as e:
         print(f"[state] save failed: {e}")
+
+
+def get_provider_lock(provider: str) -> asyncio.Lock:
+    lock = _provider_locks.get(provider)
+    if lock is None:
+        lock = asyncio.Lock()
+        _provider_locks[provider] = lock
+    return lock
 
 
 # ----- TDLib JSON binding -----
@@ -182,7 +263,7 @@ def td_receive(timeout: float = 1.0):
 
 
 def td_execute(query: dict) -> Optional[dict]:
-    """Synchronous TDLib call. Used for parseTextEntities (markdown/HTML formatting)."""
+    """Synchronous TDLib call. Used for parseTextEntities."""
     raw = _td.td_json_client_execute(_client, json.dumps(query).encode("utf-8"))
     if not raw:
         return None
@@ -263,23 +344,54 @@ async def periodic_save() -> None:
 
 
 # ----- Rule matching -----
-def match_rule(text: str) -> Optional[dict]:
+def _strip_continue_marker(text: str) -> tuple[str, bool]:
+    keyword = get_continue_keyword()
+    if not keyword:
+        return text, False
+    stripped = text.rstrip()
+    lower = stripped.lower()
+    marker = f" {keyword.lower()}"
+    if lower.endswith(marker):
+        return stripped[: -len(marker)].rstrip(), True
+    return text, False
+
+
+def _rule_matches_text(text: str, rule: dict) -> bool:
     stripped = text.strip()
     lower = stripped.lower()
+    keyword = rule.get("keyword", "")
+    if not keyword:
+        return False
+    match_type = rule.get("match", "exact")
+    kw_lower = keyword.lower()
+    if match_type == "exact":
+        return stripped == keyword
+    if match_type == "contains":
+        return keyword in text
+    if match_type == "prefix":
+        return lower.startswith(kw_lower)
+    if match_type == "suffix":
+        return lower.endswith(kw_lower)
+    return False
+
+
+def match_rule(text: str) -> Optional[dict]:
+    base_text, continue_context = _strip_continue_marker(text)
     for rule in get_rules():
-        keyword = rule.get("keyword", "")
-        if not keyword:
+        if rule.get("action") != "set_provider":
             continue
-        match_type = rule.get("match", "exact")
-        kw_lower = keyword.lower()
-        if match_type == "exact" and stripped == keyword:
-            return rule
-        if match_type == "contains" and keyword in text:
-            return rule
-        if match_type == "prefix" and lower.startswith(kw_lower):
-            return rule
-        if match_type == "suffix" and lower.endswith(kw_lower):
-            return rule
+        if _rule_matches_text(text, rule):
+            return copy.deepcopy(rule)
+
+    for rule in get_rules():
+        candidate = base_text if rule.get("action") == "ask_llm" else text
+        if not _rule_matches_text(candidate, rule):
+            continue
+        matched = copy.deepcopy(rule)
+        if matched.get("action") == "ask_llm":
+            matched["_continue"] = continue_context
+            matched["_effective_text"] = base_text
+        return matched
     return None
 
 
@@ -296,39 +408,21 @@ def strip_prefix(text: str, prefix: str) -> str:
     return text
 
 
-# ----- Markdown → Telegram HTML converter -----
-
+# ----- Markdown -> Telegram HTML converter -----
 _PLACEHOLDER_RE = re.compile(r"\x00C(\d+)\x00")
 
 
 def md_to_telegram_html(text: str) -> str:
-    """Convert standard markdown (as AI models output) to Telegram-flavored HTML.
-
-    Telegram HTML only supports a small subset of inline tags. We map:
-        **bold** / __bold__         -> <b>
-        *italic* / _italic_         -> <i>
-        ~~strike~~                  -> <s>
-        `inline code`               -> <code>
-        ```lang\\ncode```           -> <pre><code class="language-lang">
-        [text](url)                 -> <a href="url">
-        # Header                    -> <b> (Telegram has no header tag)
-        - / * bullet                -> • prefix (no list tag)
-
-    Code blocks and link URLs are stashed first so the inline-formatting
-    regexes can't mangle their contents. Bold/italic regexes use word-boundary
-    lookarounds so identifiers (`foo_bar`, `2*x*5`) aren't accidentally matched.
-    """
+    """Convert common standard markdown to Telegram-flavored HTML."""
     segments: list = []
 
     def stash(m):
         segments.append(m.group(0))
         return f"\x00C{len(segments) - 1}\x00"
 
-    # 1) Stash code blocks (raw content preserved through escaping)
     text = re.sub(r"```(?:[\w+-]*\n)?.*?```", stash, text, flags=re.DOTALL)
     text = re.sub(r"`[^`\n]+`", stash, text)
 
-    # 2) Stash markdown links as fully-formed anchor tags
     def stash_link(m):
         link_text = m.group(1)
         url = m.group(2)
@@ -339,32 +433,16 @@ def md_to_telegram_html(text: str) -> str:
         return f"\x00C{len(segments) - 1}\x00"
 
     text = re.sub(r"\[([^\[\]]+?)\]\(([^()\s]+?)\)", stash_link, text)
-
-    # 3) HTML-escape the rest
     text = html_module.escape(text, quote=False)
 
-    # 4) Headers (before bold, so `# **x**` still gets bolded inside)
     text = re.sub(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", r"<b>\1</b>", text, flags=re.MULTILINE)
-
-    # 5) Bold (process before italic so ** doesn't get half-eaten).
-    # ASCII-only boundary class so Korean / Japanese / Chinese text adjacent to
-    # ** still bolds (`안녕**중요**입니다`). Python's \w would match those as
-    # word chars and block the match.
     text = re.sub(r"(?<![A-Za-z0-9_*])\*\*(.+?)\*\*(?![A-Za-z0-9_*])", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"(?<![A-Za-z0-9_])__(.+?)__(?![A-Za-z0-9_])", r"<b>\1</b>", text, flags=re.DOTALL)
-
-    # 6) Italic — same ASCII-only boundary; still skips identifiers (foo_bar)
-    # and math (2*x*5) but allows non-ASCII text adjacent to a single * or _.
     text = re.sub(r"(?<![A-Za-z0-9_*])\*(?!\*)(.+?)(?<!\*)\*(?![A-Za-z0-9_*])", r"<i>\1</i>", text, flags=re.DOTALL)
     text = re.sub(r"(?<![A-Za-z0-9_])_(?!_)(.+?)(?<!_)_(?![A-Za-z0-9_])", r"<i>\1</i>", text, flags=re.DOTALL)
-
-    # 7) Strikethrough
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
+    text = re.sub(r"^[ \t]*[-*][ \t]+", "- ", text, flags=re.MULTILINE)
 
-    # 8) Bullets at start of line
-    text = re.sub(r"^[ \t]*[-*][ \t]+", "• ", text, flags=re.MULTILINE)
-
-    # 9) Restore stashed segments to their final HTML form
     def restore(m):
         idx = int(m.group(1))
         raw = segments[idx]
@@ -380,7 +458,6 @@ def md_to_telegram_html(text: str) -> str:
                     return f'<pre><code class="language-{lang}">{code_esc}</code></pre>'
                 return f"<pre>{code_esc}</pre>"
             return html_module.escape(raw, quote=False)
-        # Inline `code`
         inner = raw[1:-1]
         return f"<code>{html_module.escape(inner, quote=False)}</code>"
 
@@ -388,7 +465,7 @@ def md_to_telegram_html(text: str) -> str:
 
 
 def format_text(text: str) -> dict:
-    """Convert markdown text to a TDLib formattedText, falling back to plain on parse error."""
+    """Convert markdown text to TDLib formattedText, falling back to plain text."""
     if not text:
         return {"@type": "formattedText", "text": "(empty)"}
     html_text = md_to_telegram_html(text)
@@ -422,7 +499,7 @@ def send_reply(chat_id: int, message_id: int, text: str) -> None:
 
 
 async def get_message_text(chat_id: int, message_id: int) -> str:
-    """Fetch a message via TDLib and extract its text or caption."""
+    """Fetch a message via TDLib and extract text or caption."""
     msg = await td_request({
         "@type": "getMessage",
         "chat_id": chat_id,
@@ -440,7 +517,7 @@ async def get_message_text(chat_id: int, message_id: int) -> str:
 
 
 def extract_reply_context(message: dict) -> Optional[dict]:
-    """If `message` is itself a reply, return the (chat_id, message_id) it replies to."""
+    """If `message` is itself a reply, return the original chat/message ids."""
     reply_to = message.get("reply_to")
     if not reply_to or reply_to.get("@type") != "messageReplyToMessage":
         return None
@@ -450,114 +527,295 @@ def extract_reply_context(message: dict) -> Optional[dict]:
     }
 
 
-# ----- AI clients -----
-TRANSLATE_PROMPT = (
-    "Translate the following text to {lang}. "
-    "Output only the translation — no quotes, no commentary, no explanations.\n\n"
-    "Text:\n{text}"
-)
+# ----- CLI bridge helpers -----
+def make_request_paths(provider: str, action: str) -> dict:
+    request_id = f"{int(time.time())}-{provider}-{uuid.uuid4().hex[:8]}"
+    request_dir = get_bridge_root() / "requests" / request_id
+    request_dir.mkdir(parents=True, exist_ok=False)
+    return {
+        "id": request_id,
+        "dir": request_dir,
+        "input": request_dir / "input.md",
+        "output": request_dir / "output.md",
+        "meta": request_dir / "meta.json",
+        "action": action,
+        "provider": provider,
+    }
 
 
-async def call_openai(prompt: str, model: str, search: bool = False) -> str:
-    if not OPENAI_API_KEY:
-        return "[error] OPENAI_API_KEY not set"
+def write_request_files(paths: dict, prompt: str, meta: dict) -> None:
+    paths["input"].write_text(prompt, encoding="utf-8")
+    payload = {
+        "request_id": paths["id"],
+        "provider": paths["provider"],
+        "action": paths["action"],
+        "created_at": time.time(),
+        "input_path": str(paths["input"]),
+        "output_path": str(paths["output"]),
+    }
+    payload.update(meta)
+    paths["meta"].write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def wait_for_output(path: Path, timeout: float) -> Optional[str]:
+    cfg = get_llm_config()
+    poll = float(cfg.get("poll_interval_seconds", 1.0))
+    stable_seconds = float(cfg.get("output_stable_seconds", 1.0))
+    deadline = time.monotonic() + timeout
+    last_size = -1
+    stable_since: Optional[float] = None
+
+    while time.monotonic() < deadline:
+        if path.exists():
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            if size > 0:
+                now = time.monotonic()
+                if size == last_size:
+                    if stable_since is None:
+                        stable_since = now
+                    if now - stable_since >= stable_seconds:
+                        text = path.read_text(encoding="utf-8").strip()
+                        if text:
+                            return text
+                else:
+                    last_size = size
+                    stable_since = now
+        await asyncio.sleep(poll)
+    return None
+
+
+def run_checked(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs)
+
+
+def tmux_session_exists(session_name: str) -> bool:
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", session_name],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def kill_tmux_session(session_name: str) -> None:
+    subprocess.run(
+        ["tmux", "kill-session", "-t", session_name],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def start_tmux_session(provider: str, provider_cfg: dict,
+                       command_template: Optional[str] = None,
+                       initial_prompt: Optional[str] = None) -> None:
+    session_name = provider_cfg["session_name"]
+    command = format_template(command_template or provider_cfg["command"], root=ROOT)
+    if initial_prompt:
+        command = f"{command} {shlex.quote(initial_prompt)}"
+    run_checked([
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        session_name,
+        "-c",
+        str(ROOT),
+        command,
+    ])
+    print(f"[llm] started {provider} tmux session: {session_name}")
+
+
+async def ensure_provider_session(provider: str, continue_context: bool,
+                                  command_template: Optional[str] = None,
+                                  initial_prompt: Optional[str] = None) -> tuple[str, dict]:
+    provider_cfg = get_provider_config(provider)
+    if not provider_cfg:
+        raise RuntimeError(f"unknown provider: {provider}")
+
+    session_name = provider_cfg["session_name"]
+    reset_strategy = provider_cfg.get("reset_strategy", "recreate")
+    should_reset = (not continue_context and reset_strategy == "recreate") or bool(initial_prompt)
+
+    if should_reset and tmux_session_exists(session_name):
+        kill_tmux_session(session_name)
+
+    started = False
+    if not tmux_session_exists(session_name):
+        start_tmux_session(
+            provider,
+            provider_cfg,
+            command_template=command_template,
+            initial_prompt=initial_prompt,
+        )
+        started = True
+
+    if started or should_reset:
+        await asyncio.sleep(float(provider_cfg.get("startup_delay_seconds", 3.0)))
+
+    return session_name, provider_cfg
+
+
+def paste_to_tmux(session_name: str, text: str) -> None:
+    target = f"{session_name}:0.0"
+    buffer_name = f"tgself-{uuid.uuid4().hex[:8]}"
+    subprocess.run(
+        ["tmux", "load-buffer", "-b", buffer_name, "-"],
+        input=text,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
     try:
-        async with httpx.AsyncClient(timeout=120 if search else 60) as client:
-            if search:
-                # chat/completions has no `web_search` tool for gpt-5.x; the
-                # Responses API (/v1/responses) is the canonical tool-use path.
-                r = await client.post(
-                    "https://api.openai.com/v1/responses",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "input": prompt,
-                        "tools": [{"type": "web_search"}],
-                    },
-                )
-            else:
-                r = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                )
-        if r.status_code != 200:
-            return f"[openai {r.status_code}] {r.text[:200]}"
-        data = r.json()
-        if search:
-            # Responses API: SDKs expose an aggregated `output_text` convenience
-            # field, but raw HTTP may omit it — fall back to walking output[]
-            # and pulling text out of the assistant message item.
-            if isinstance(data.get("output_text"), str) and data["output_text"]:
-                return data["output_text"].strip()
-            for item in data.get("output", []):
-                if item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_text":
-                            return (c.get("text") or "").strip()
-            return "[openai error] no text in response"
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"[openai error] {e}"
+        run_checked(["tmux", "paste-buffer", "-b", buffer_name, "-t", target])
+    finally:
+        subprocess.run(
+            ["tmux", "delete-buffer", "-b", buffer_name],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
-async def call_gemini(prompt: str, model: str, search: bool = False) -> str:
-    if not GEMINI_API_KEY:
-        return "[error] GEMINI_API_KEY not set"
+def submit_tmux_prompt(session_name: str, submit_keys: list[str]) -> None:
+    target = f"{session_name}:0.0"
+    for key in submit_keys or ["Enter"]:
+        run_checked(["tmux", "send-keys", "-t", target, key])
+
+
+def build_translation_prompt(text: str, lang: str) -> str:
+    return (
+        f"Translate the following text to {lang}.\n"
+        "Output only the translation. Do not include quotes, commentary, "
+        "explanations, markdown fences, or extra labels.\n\n"
+        "Text:\n"
+        f"{text}"
+    )
+
+
+def build_interactive_input(provider: str, prompt: str, output_path: Path,
+                            continue_context: bool) -> str:
+    return f"{prompt.strip()}\n"
+
+
+def build_tmux_prompt(input_path: Path, output_path: Path) -> str:
+    return (
+        f"Read {input_path}. "
+        f"Write only your final answer to {output_path}."
+    )
+
+
+async def call_translation_cli(source: str, lang: str) -> str:
+    cfg = get_llm_config().get("translation", {})
+    provider = cfg.get("provider", "codex")
+    timeout = float(cfg.get("timeout_seconds", 120))
+    paths = make_request_paths(provider, "translate")
+    prompt = build_translation_prompt(source, lang)
+    write_request_files(paths, prompt, {
+        "target_lang": lang,
+        "mode": "headless",
+    })
+
+    command_template = cfg.get("command") or DEFAULT_LLM_CONFIG["translation"]["command"]
+    command = format_template(command_template, root=ROOT, output=paths["output"])
+    args = shlex.split(command)
+
     try:
-        payload: dict = {"contents": [{"parts": [{"text": prompt}]}]}
-        if search:
-            # `google_search` is the grounding tool for gemini-2.x / 3.x.
-            # (gemini-1.5 used the older `google_search_retrieval` name.)
-            payload["tools"] = [{"google_search": {}}]
-        async with httpx.AsyncClient(timeout=120 if search else 60) as client:
-            r = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                params={"key": GEMINI_API_KEY},
-                headers={"Content-Type": "application/json"},
-                json=payload,
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(ROOT),
+        )
+    except FileNotFoundError as e:
+        print(f"[llm] translation command not found: {e}")
+        return "[error] translation command not found"
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(prompt.encode("utf-8")),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        print(f"[llm] {provider} translation timed out after {int(timeout)}s")
+        return "[error] translation timed out"
+
+    if proc.returncode != 0:
+        err = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        print(f"[llm] {provider} translation failed ({proc.returncode}): {err[:500]}")
+        return "[error] translation failed"
+
+    if paths["output"].exists():
+        result = paths["output"].read_text(encoding="utf-8").strip()
+        if result:
+            return result
+
+    result = stdout.decode("utf-8", errors="replace").strip()
+    return result or "[error] empty translation output"
+
+
+async def call_interactive_cli(provider: str, prompt: str,
+                               continue_context: bool = False) -> str:
+    if not is_valid_provider(provider):
+        return f"[error] unknown provider: {provider}"
+
+    lock = get_provider_lock(provider)
+    async with lock:
+        paths = make_request_paths(provider, "ask_llm")
+        interactive_input = build_interactive_input(
+            provider,
+            prompt,
+            paths["output"],
+            continue_context,
+        )
+        write_request_files(paths, interactive_input, {
+            "mode": "interactive",
+            "continue_context": continue_context,
+        })
+
+        try:
+            tmux_prompt = build_tmux_prompt(paths["input"], paths["output"])
+            provider_cfg = get_provider_config(provider) or {}
+            prompt_delivery = provider_cfg.get("prompt_delivery", "paste")
+            command_template = None
+            initial_prompt = None
+            if prompt_delivery == "argv":
+                if continue_context and provider_cfg.get("continue_command"):
+                    command_template = provider_cfg["continue_command"]
+                    initial_prompt = tmux_prompt
+                elif not continue_context:
+                    command_template = provider_cfg.get("command")
+                    initial_prompt = tmux_prompt
+            session_name, provider_cfg = await ensure_provider_session(
+                provider,
+                continue_context,
+                command_template=command_template,
+                initial_prompt=initial_prompt,
             )
-        if r.status_code != 200:
-            return f"[gemini {r.status_code}] {r.text[:200]}"
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        return f"[gemini error] {e}"
+            if initial_prompt is None:
+                paste_to_tmux(session_name, tmux_prompt)
+                submit_tmux_prompt(session_name, provider_cfg.get("submit_keys", ["Enter"]))
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            print(f"[llm] {provider} bridge failed: {e}")
+            return "[error] LLM bridge failed"
 
-
-async def call_ai(prompt: str, model: Optional[str] = None, search: bool = False) -> str:
-    model = model or get_current_model()
-    if not model:
-        return "[error] no model selected"
-    provider = get_provider(model)
-    if provider == "openai":
-        return await call_openai(prompt, model, search=search)
-    if provider == "gemini":
-        return await call_gemini(prompt, model, search=search)
-    return f"[error] unknown model: {model}"
+        timeout = float(provider_cfg.get("timeout_seconds", 900))
+        result = await wait_for_output(paths["output"], timeout)
+        if result:
+            return result
+        print(f"[llm] {provider} timed out after {int(timeout)}s; session={session_name}")
+        return "[error] LLM response timed out"
 
 
 # ----- Action implementations -----
 async def _do_translate(text: str, reply_ctx: Optional[dict], rule: dict) -> str:
-    """Translate logic.
-
-    - Reply context + trigger ONLY (e.g. just `to en`)  -> translate the original
-      message we're replying to.
-    - Reply context + my own text before the trigger    -> translate MY text
-      (the user might be writing a translation of their own message even while
-      replying to someone — don't yank the source from the reply target).
-    - No reply context + my text                        -> translate my text.
-    - No reply context + bare trigger                   -> error.
-    """
     keyword = rule.get("keyword", "")
     target_lang = rule.get("lang", "English")
     user_part = strip_suffix(text, keyword)
@@ -571,13 +829,16 @@ async def _do_translate(text: str, reply_ctx: Optional[dict], rule: dict) -> str
     else:
         return "[error] empty source"
 
-    prompt = TRANSLATE_PROMPT.format(lang=target_lang, text=source)
-    return await call_ai(prompt)
+    return await call_translation_cli(source, target_lang)
 
 
-async def _do_ask_ai(text: str, reply_ctx: Optional[dict], rule: dict) -> str:
+async def _do_ask_llm(text: str, reply_ctx: Optional[dict], rule: dict) -> str:
     keyword = rule.get("keyword", "")
-    user_part = strip_suffix(text, keyword)
+    provider = rule.get("provider") or get_current_provider()
+    effective_text = rule.get("_effective_text") or text
+    continue_context = bool(rule.get("_continue"))
+    user_part = strip_suffix(effective_text, keyword)
+
     if reply_ctx:
         source = await get_message_text(reply_ctx["chat_id"], reply_ctx["message_id"])
         if not source:
@@ -587,19 +848,24 @@ async def _do_ask_ai(text: str, reply_ctx: Optional[dict], rule: dict) -> str:
         if not user_part:
             return "[error] empty prompt"
         prompt = user_part
-    return await call_ai(prompt, search=bool(rule.get("search")))
+
+    return await call_interactive_cli(provider, prompt, continue_context=continue_context)
 
 
-def _do_set_model(text: str, rule: dict) -> str:
+def _do_set_provider(text: str, rule: dict) -> str:
     keyword = rule.get("keyword", "")
-    new_model = strip_prefix(text, keyword).strip()
-    if not new_model:
-        return "[error] no model name"
-    provider = get_provider(new_model)
-    if provider is None:
-        return f"[error] unknown model: {new_model}"
-    set_current_model(new_model)
-    return f"[ok] model -> {new_model} ({provider})"
+    new_provider = strip_prefix(text, keyword).strip().lower()
+    if not new_provider:
+        return "[error] no provider name"
+    if not is_valid_provider(new_provider):
+        providers = ", ".join(sorted(get_provider_names()))
+        return f"[error] unknown provider: {new_provider}. Available: {providers}"
+    set_current_provider(new_provider)
+    return f"[ok] provider -> {new_provider}"
+
+
+def _provider_for_rule(rule: dict) -> str:
+    return rule.get("provider") or get_current_provider()
 
 
 async def dispatch_action(text: str, chat_id: int, message_id: int,
@@ -610,10 +876,10 @@ async def dispatch_action(text: str, chat_id: int, message_id: int,
             result = rule.get("text", "")
         elif action == "translate":
             result = await _do_translate(text, reply_ctx, rule)
-        elif action == "ask_ai":
-            result = await _do_ask_ai(text, reply_ctx, rule)
-        elif action == "set_model":
-            result = _do_set_model(text, rule)
+        elif action == "ask_llm":
+            result = await _do_ask_llm(text, reply_ctx, rule)
+        elif action == "set_provider":
+            result = _do_set_provider(text, rule)
         else:
             result = f"[error] unknown action: {action}"
     except Exception as e:
@@ -684,11 +950,9 @@ def request_load_chats() -> None:
 
 # ----- Message handling -----
 async def handle_new_message(message: dict) -> None:
-    """Record + dispatch action for outgoing messages the user sent from another device."""
+    """Record + dispatch action for outgoing messages from another device."""
     if not message.get("is_outgoing"):
         return
-    # Daemon-sent messages have a `sending_state` set while in flight; skip them
-    # so a reply that itself matches a rule can't loop.
     if message.get("sending_state") is not None:
         return
 
@@ -719,7 +983,6 @@ async def handle_new_message(message: dict) -> None:
 
     if rule:
         reply_ctx = extract_reply_context(message)
-        # Spawn so the event loop keeps draining updates while AI calls are in flight.
         asyncio.create_task(dispatch_action(text, chat_id, message_id, reply_ctx, rule))
 
 
@@ -731,7 +994,8 @@ def log_self_message(record: dict, rule: Optional[dict]) -> None:
     if rule:
         action = rule.get("action", "reply")
         keyword = rule.get("keyword", "")
-        print(f"[me] {where} | {text!r}  [{action}: {keyword!r}]")
+        marker = " cont" if rule.get("_continue") else ""
+        print(f"[me] {where} | {text!r}  [{action}: {keyword!r}{marker}]")
     else:
         print(f"[me] {where} | {text!r}")
 
@@ -754,7 +1018,6 @@ async def event_loop() -> None:
         if update is None:
             continue
 
-        # Route @extra-tagged responses to pending td_request callers.
         extra = update.get("@extra")
         if extra and extra in _pending_requests:
             fut = _pending_requests[extra]
@@ -781,15 +1044,12 @@ async def event_loop() -> None:
 
 
 async def main() -> None:
-    # 0 = FATAL only. Synchronous so it takes effect before any other TDLib chatter.
     td_execute({"@type": "setLogVerbosityLevel", "new_verbosity_level": 0})
     load_state()
     load_messages()
-    print(f"[init] model={get_current_model() or '(unset)'}")
-    if not OPENAI_API_KEY:
-        print("[init] OPENAI_API_KEY not set — gpt-* models will fail")
-    if not GEMINI_API_KEY:
-        print("[init] GEMINI_API_KEY not set — gemini-* models disabled")
+    bridge_root = get_bridge_root()
+    bridge_root.mkdir(parents=True, exist_ok=True)
+    print(f"[init] provider={get_current_provider() or '(unset)'} bridge={bridge_root}")
     saver_task = asyncio.create_task(periodic_save())
     try:
         await event_loop()

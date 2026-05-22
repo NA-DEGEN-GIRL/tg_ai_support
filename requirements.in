@@ -1,1 +1,1 @@
-httpx
+# No Python package dependencies. LLM access uses local authenticated CLIs.

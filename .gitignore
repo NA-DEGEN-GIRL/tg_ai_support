@@ -9,3 +9,4 @@ messages.json
 messages.json.tmp
 state.json
 state.json.tmp
+.llm_bridge/
