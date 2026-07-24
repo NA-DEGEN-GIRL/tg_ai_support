@@ -25,7 +25,7 @@
                 "command": "codex --no-alt-screen --search -C {root} --dangerously-bypass-approvals-and-sandbox",
                 "continue_command": "codex resume --last --no-alt-screen --search -C {root} --dangerously-bypass-approvals-and-sandbox",
                 "prompt_delivery": "argv",
-                "timeout_seconds": 900,
+                "timeout_seconds": 300,
                 "startup_delay_seconds": 3.0,
                 "reset_strategy": "recreate"
             },
@@ -34,16 +34,16 @@
                 "command": "claude --dangerously-skip-permissions",
                 "continue_command": "claude --continue --dangerously-skip-permissions",
                 "prompt_delivery": "argv",
-                "timeout_seconds": 900,
+                "timeout_seconds": 300,
                 "startup_delay_seconds": 3.0,
                 "reset_strategy": "recreate"
             },
             "grok": {
                 "session_name": "tgself-grok",
                 "command": "grok --no-alt-screen --cwd {root} --always-approve --permission-mode bypassPermissions",
-                "prompt_delivery": "paste",
-                "submit_keys": ["Enter"],
-                "timeout_seconds": 900,
+                "continue_command": "grok --continue --no-alt-screen --cwd {root} --always-approve --permission-mode bypassPermissions",
+                "prompt_delivery": "argv",
+                "timeout_seconds": 300,
                 "startup_delay_seconds": 3.0,
                 "reset_strategy": "recreate"
             }

@@ -48,7 +48,7 @@ DEFAULT_LLM_CONFIG = {
         "timeout_seconds": 120,
         "command": (
             "codex exec -C {root} --sandbox read-only "
-            "--ask-for-approval never -o {output} -"
+            "-o {output} -"
         ),
     },
     "providers": {
@@ -63,7 +63,7 @@ DEFAULT_LLM_CONFIG = {
                 "--dangerously-bypass-approvals-and-sandbox"
             ),
             "prompt_delivery": "argv",
-            "timeout_seconds": 900,
+            "timeout_seconds": 300,
             "startup_delay_seconds": 3.0,
             "reset_strategy": "recreate",
         },
@@ -72,7 +72,7 @@ DEFAULT_LLM_CONFIG = {
             "command": "claude --dangerously-skip-permissions",
             "continue_command": "claude --continue --dangerously-skip-permissions",
             "prompt_delivery": "argv",
-            "timeout_seconds": 900,
+            "timeout_seconds": 300,
             "startup_delay_seconds": 3.0,
             "reset_strategy": "recreate",
         },
@@ -82,14 +82,67 @@ DEFAULT_LLM_CONFIG = {
                 "grok --no-alt-screen --cwd {root} --always-approve "
                 "--permission-mode bypassPermissions"
             ),
-            "prompt_delivery": "paste",
-            "submit_keys": ["Enter"],
-            "timeout_seconds": 900,
+            "continue_command": (
+                "grok --continue --no-alt-screen --cwd {root} --always-approve "
+                "--permission-mode bypassPermissions"
+            ),
+            "prompt_delivery": "argv",
+            "timeout_seconds": 300,
             "startup_delay_seconds": 3.0,
             "reset_strategy": "recreate",
         },
     },
 }
+
+
+# Substrings (lowercased) that mean a provider CLI cannot serve the request and
+# will never write output.md -- almost always an expired/revoked login. Matched
+# against the tmux pane (interactive) or CLI stderr/stdout (headless) so the
+# daemon can fail fast with an actionable message instead of polling until the
+# full timeout elapses. Kept login/quota specific to avoid matching real answers.
+DEFAULT_CLI_ERROR_SIGNATURES = [
+    "please log out and sign in again",
+    "sign in again",
+    "token_expired",
+    "authentication token is expired",
+    "your access token could not be refreshed",
+    "refresh token was revoked",
+    "please run /login",
+    "invalid authentication credentials",
+    "not logged in",
+    "you are not logged in",
+    "please login",
+    "run `codex login`",
+    "run 'codex login'",
+    "hit your usage limit",
+    "usage limit reached",
+    "purchase more credits",
+    "quota exceeded",
+    "rate limit exceeded",
+]
+
+# Subset of the signatures above that mean "logged in but out of quota" rather
+# than "not logged in" -- re-login does not help, so the user message differs.
+QUOTA_ERROR_SIGNATURES = {
+    "hit your usage limit",
+    "usage limit reached",
+    "purchase more credits",
+    "quota exceeded",
+    "rate limit exceeded",
+}
+
+
+def describe_cli_error(provider: str, sig: str) -> str:
+    """Actionable user-facing message for a detected fatal CLI signature."""
+    if sig in QUOTA_ERROR_SIGNATURES:
+        return (
+            f"[error] {provider} 사용량 한도 초과 (감지: {sig}). "
+            f"한도 초기화 후 다시 시도하거나 다른 provider를 사용하세요."
+        )
+    return (
+        f"[error] {provider} 로그인/인증이 필요합니다 (감지: {sig}). "
+        f"터미널에서 `{provider}` 재로그인 후 다시 시도하세요."
+    )
 
 
 # ----- Config (hot reload on mtime) -----
@@ -557,34 +610,65 @@ def write_request_files(paths: dict, prompt: str, meta: dict) -> None:
     paths["meta"].write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-async def wait_for_output(path: Path, timeout: float) -> Optional[str]:
+async def wait_for_output(
+    path: Path,
+    timeout: float,
+    session_name: Optional[str] = None,
+    error_signatures: Optional[list[str]] = None,
+) -> tuple[str, Optional[str]]:
+    """Poll for a stable, non-empty output file.
+
+    Returns a (kind, value) tuple:
+      ("ok", text)           output file written and stable
+      ("timeout", None)      deadline passed with no usable output
+      ("cli_error", sig)     provider pane showed a fatal error (auth/quota)
+      ("session_died", None) provider session vanished before writing output
+
+    When `session_name` is given, the provider's tmux pane is inspected while the
+    output file is still empty so unrecoverable states (expired login, killed
+    session) fail fast instead of waiting out the whole timeout.
+    """
     cfg = get_llm_config()
     poll = float(cfg.get("poll_interval_seconds", 1.0))
     stable_seconds = float(cfg.get("output_stable_seconds", 1.0))
+    signatures = (
+        error_signatures if error_signatures is not None else DEFAULT_CLI_ERROR_SIGNATURES
+    )
     deadline = time.monotonic() + timeout
     last_size = -1
     stable_since: Optional[float] = None
 
     while time.monotonic() < deadline:
+        size = 0
         if path.exists():
             try:
                 size = path.stat().st_size
             except OSError:
                 size = 0
-            if size > 0:
-                now = time.monotonic()
-                if size == last_size:
-                    if stable_since is None:
-                        stable_since = now
-                    if now - stable_since >= stable_seconds:
-                        text = path.read_text(encoding="utf-8").strip()
-                        if text:
-                            return text
-                else:
-                    last_size = size
+
+        if size > 0:
+            now = time.monotonic()
+            if size == last_size:
+                if stable_since is None:
                     stable_since = now
+                if now - stable_since >= stable_seconds:
+                    text = path.read_text(encoding="utf-8").strip()
+                    if text:
+                        return ("ok", text)
+            else:
+                last_size = size
+                stable_since = now
+        elif session_name is not None:
+            # Nothing written yet: watch for terminal CLI states so an expired
+            # login (which never produces output) does not burn the full timeout.
+            if not tmux_session_exists(session_name):
+                return ("session_died", None)
+            sig = detect_cli_error(capture_pane_text(session_name), signatures)
+            if sig:
+                return ("cli_error", sig)
+
         await asyncio.sleep(poll)
-    return None
+    return ("timeout", None)
 
 
 def run_checked(args: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -608,6 +692,29 @@ def kill_tmux_session(session_name: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def capture_pane_text(session_name: str) -> str:
+    """Return the visible text of a provider's tmux pane (empty on failure)."""
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", f"{session_name}:0.0", "-p"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def detect_cli_error(text: str, signatures: list[str]) -> Optional[str]:
+    """Return the first fatal-error signature found in `text`, else None."""
+    lowered = text.lower()
+    if not lowered:
+        return None
+    for sig in signatures:
+        if sig in lowered:
+            return sig
+    return None
 
 
 def start_tmux_session(provider: str, provider_cfg: dict,
@@ -747,8 +854,11 @@ async def call_translation_cli(source: str, lang: str) -> str:
         print(f"[llm] {provider} translation timed out after {int(timeout)}s")
         return "[error] translation timed out"
 
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
+
     if proc.returncode != 0:
-        err = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        err = (stderr_text or stdout_text).strip()
         print(f"[llm] {provider} translation failed ({proc.returncode}): {err[:500]}")
         return "[error] translation failed"
 
@@ -757,7 +867,14 @@ async def call_translation_cli(source: str, lang: str) -> str:
         if result:
             return result
 
-    result = stdout.decode("utf-8", errors="replace").strip()
+    # `codex exec` exits 0 even when the login is expired, leaving output.md
+    # empty. Surface an actionable auth message instead of a vague empty error.
+    sig = detect_cli_error(f"{stderr_text}\n{stdout_text}", DEFAULT_CLI_ERROR_SIGNATURES)
+    if sig:
+        print(f"[llm] {provider} translation CLI error ({sig!r})")
+        return describe_cli_error(provider, sig)
+
+    result = stdout_text.strip()
     return result or "[error] empty translation output"
 
 
@@ -806,11 +923,29 @@ async def call_interactive_cli(provider: str, prompt: str,
             print(f"[llm] {provider} bridge failed: {e}")
             return "[error] LLM bridge failed"
 
-        timeout = float(provider_cfg.get("timeout_seconds", 900))
-        result = await wait_for_output(paths["output"], timeout)
-        if result:
-            return result
-        print(f"[llm] {provider} timed out after {int(timeout)}s; session={session_name}")
+        timeout = float(provider_cfg.get("timeout_seconds", 300))
+        signatures = provider_cfg.get("error_signatures")
+        kind, value = await wait_for_output(
+            paths["output"],
+            timeout,
+            session_name=session_name,
+            error_signatures=signatures,
+        )
+        if kind == "ok":
+            return value
+
+        # Any failure: tear down the (likely wedged) session so it neither
+        # lingers as a zombie process nor poisons a later `cont` request.
+        if provider_cfg.get("kill_on_failure", True):
+            kill_tmux_session(session_name)
+
+        if kind == "cli_error":
+            print(f"[llm] {provider} CLI error ({value!r}); session={session_name} killed")
+            return describe_cli_error(provider, value)
+        if kind == "session_died":
+            print(f"[llm] {provider} session ended before writing output; session={session_name}")
+            return f"[error] {provider} 세션이 응답 없이 종료됨 (로그인/실행 상태를 확인하세요)"
+        print(f"[llm] {provider} timed out after {int(timeout)}s; session={session_name} killed")
         return "[error] LLM response timed out"
 
 
